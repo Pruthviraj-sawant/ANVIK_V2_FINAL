@@ -1,0 +1,472 @@
+import { z } from 'zod';
+import prisma from '../db/prismaClient.js';
+import { embeddingModelName, EMBEDDING_DIMENSION } from '../gemini.js';
+import logger from '../utils/logger.js';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { encrypt, decrypt } from '../utils/encryption.js';
+
+export const chatRequestSchema = z.object({
+  messages: z.array(z.any()),
+  metadata: z.object({
+    projectId: z.string(), // This is spaceId in database
+    model: z.string().optional(), // We'll use Gemini regardless
+  }),
+});
+
+export const titleRequestSchema = z.object({
+  prompt: z.string(),
+});
+
+if (!process.env.GEMINI_API_KEY) {
+  throw new Error('GEMINI_API_KEY environment variable is required');
+}
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// Memory service using Prisma and MemoryEntry table
+export class MemoryService {
+  // --- Tunables ---
+  private getTopK(): number {
+    const raw = process.env.MEM_SEARCH_TOP_K;
+    const val = raw ? Number(raw) : 10;
+    return Number.isFinite(val) && val > 0 ? Math.min(val, 50) : 10;
+  }
+
+  private getMinSimilarity(): number {
+    const raw = process.env.MEM_SEARCH_MIN_SIMILARITY;
+    const val = raw ? Number(raw) : 0.2;
+    if (!Number.isFinite(val)) return 0.2;
+    return Math.max(0, Math.min(1, val));
+  }
+
+  private getUpdateMinSimilarity(): number {
+    const raw = process.env.MEM_UPDATE_MIN_SIMILARITY;
+    const val = raw ? Number(raw) : 0.75;
+    if (!Number.isFinite(val)) return 0.75;
+    return Math.max(0, Math.min(1, val));
+  }
+
+  private getUpdateMaxParents(): number {
+    const raw = process.env.MEM_UPDATE_MAX_PARENTS;
+    const val = raw ? Number(raw) : 1;
+    return Number.isFinite(val) && val >= 0 ? Math.min(val, 5) : 1;
+  }
+  // Generate embedding for text using Gemini
+  private async generateEmbedding(text: string): Promise<number[]> {
+    try {
+      logger.debug({
+        msg: 'Generating embedding',
+        textLength: text?.length ?? 0,
+        model: embeddingModelName(),
+      });
+      const model = genAI.getGenerativeModel({
+        model: embeddingModelName(),
+      });
+
+      const result = await model.embedContent({
+        content: { parts: [{ text }] },
+        outputDimensionality: EMBEDDING_DIMENSION,
+      });
+      const values = result.embedding.values;
+      logger.debug({
+        msg: 'Embedding generated',
+        dimensions: values?.length,
+      });
+      return values;
+    } catch (error) {
+      logger.error({ msg: 'Error generating embedding', error });
+      throw new Error('Failed to generate embedding');
+    }
+  }
+
+  // Search memories using vector similarity on MemoryEntry table
+  async searchMemories(
+    query: string,
+    projectId: string,
+  ): Promise<{
+    success: boolean;
+    count: number;
+    results: Array<{
+      documentId: string;
+      title?: string;
+      content?: string;
+      url?: string;
+      score?: number;
+    }>;
+  }> {
+    try {
+      logger.info({
+        msg: 'Searching memories (pgvector)',
+        projectId,
+        queryLength: query?.length ?? 0,
+      });
+
+      // Get space ownerId for decryption
+      const space = await prisma.space.findUnique({
+        where: { id: projectId },
+        select: { ownerId: true },
+      });
+      const ownerId = space?.ownerId || 'unknown';
+
+      // Generate embedding for the query
+      const queryEmbedding = await this.generateEmbedding(query);
+      const queryVector = JSON.stringify(queryEmbedding);
+
+      // Execute raw SQL query for cosine distance
+      // Similarity = 1 - Cosine Distance (provided by <=> operator)
+      const topK = this.getTopK();
+      const minSim = this.getMinSimilarity();
+
+      // Note: We filter by score >= minSim in the WHERE clause or after?
+      // For efficiency, we can fetch top K first, then filter, or filter in SQL.
+      // Filtering in SQL by distance: WHERE (1 - (embedding <=> vector)) >= minSim
+      // Equivalent to: WHERE (embedding <=> vector) <= (1 - minSim)
+
+      const maxDistance = 1 - minSim;
+
+      const memories = await prisma.$queryRaw<Array<{
+        id: string;
+        memory: string;
+        metadata: any;
+        score: number;
+        createdAt: Date;
+      }>>`
+        SELECT
+          id,
+          memory,
+          metadata,
+          "createdAt",
+          1 - (embedding <=> ${queryVector}::vector) as score
+        FROM "memory_entries"
+        WHERE "spaceId" = ${projectId}
+          AND "isLatest" = true
+          AND "isForgotten" = false
+          AND "embedding" IS NOT NULL
+          AND (embedding <=> ${queryVector}::vector) <= ${maxDistance}
+        ORDER BY embedding <=> ${queryVector}::vector ASC
+        LIMIT ${topK}
+      `;
+
+      logger.info({
+        msg: 'Search completed',
+        projectId,
+        returned: memories.length,
+      });
+
+      // Decrypt memory content before returning
+      const results = memories.map((m) => {
+        const decryptedMemory = decrypt(m.memory, ownerId);
+        return {
+          documentId: m.id,
+          title: (m.metadata as any)?.title || this.extractTitleFromMemory(decryptedMemory),
+          content: decryptedMemory,
+          score: m.score,
+          url: (m.metadata as any)?.url,
+          createdAt: m.createdAt,
+        };
+      });
+
+      return {
+        success: true,
+        count: results.length,
+        results: results,
+      };
+    } catch (error) {
+      logger.error({ msg: 'Error searching memories', projectId, error });
+      return {
+        success: false,
+        count: 0,
+        results: [],
+      };
+    }
+  }
+
+  // Add a new memory with embedding
+  async addMemory(
+    memory: string,
+    projectId: string,
+  ): Promise<{
+    success: boolean;
+    memory: {
+      id: string;
+      status: string;
+    };
+  }> {
+    try {
+      logger.info({
+        msg: 'Adding memory',
+        projectId,
+        memoryLength: memory?.length ?? 0,
+      });
+      // Verify space exists and get orgId + ownerId for encryption
+      const space = await prisma.space.findUnique({
+        where: { id: projectId },
+        select: { orgId: true, ownerId: true },
+      });
+
+      if (!space) {
+        logger.warn({ msg: 'Space not found when adding memory', projectId });
+        throw new Error(`Space with id ${projectId} not found`);
+      }
+
+      const ownerId = space.ownerId;
+
+      // Generate embedding for the memory BEFORE encryption (embedding needs plaintext)
+      const embedding = await this.generateEmbedding(memory);
+      const embeddingStr = JSON.stringify(embedding);
+
+      // Encrypt the memory for storage
+      const encryptedMemory = encrypt(memory, ownerId);
+
+      // Find related existing memories (latest, same space) by cosine similarity using pgvector
+      const minUpdateSim = this.getUpdateMinSimilarity();
+      const maxUpdateDist = 1 - minUpdateSim;
+      const maxParents = this.getUpdateMaxParents();
+
+      // Fetch potential parents using vector search
+      const candidateLatest = await prisma.$queryRaw<Array<{
+        id: string;
+        memory: string;
+        version: number;
+        "parentMemoryId": string | null;
+        "rootMemoryId": string | null;
+        score: number;
+      }>>`
+        SELECT
+          id,
+          memory,
+          version,
+          "parentMemoryId",
+          "rootMemoryId",
+          1 - (embedding <=> ${embeddingStr}::vector) as score
+        FROM "memory_entries"
+        WHERE "spaceId" = ${projectId}
+          AND "isLatest" = true
+          AND "isForgotten" = false
+          AND "embedding" IS NOT NULL
+          AND (embedding <=> ${embeddingStr}::vector) <= ${maxUpdateDist}
+        ORDER BY embedding <=> ${embeddingStr}::vector ASC
+        LIMIT ${maxParents}
+      `;
+
+      // Prepare versioning fields if an update parent is found (pick best one)
+      const primaryParent = candidateLatest[0];
+      const version = primaryParent ? (primaryParent.version || 1) + 1 : 1;
+      const parentMemoryId = primaryParent ? primaryParent.id : null;
+      const rootMemoryId = primaryParent ? primaryParent.rootMemoryId || primaryParent.id : null;
+
+      // Memory relations: map parentId -> "updates"
+      const memoryRelations: Record<string, 'updates' | 'extends' | 'derives'> = {};
+      if (primaryParent) {
+        memoryRelations[primaryParent.id] = 'updates';
+      }
+
+      // Create all entities and links in a single transaction
+      const result = await prisma.$transaction(async (tx) => {
+        // If we have a parent, mark it as not-latest
+        if (primaryParent) {
+          await tx.memoryEntry.update({
+            where: { id: primaryParent.id },
+            data: { isLatest: false },
+          });
+        }
+
+        // Create the new memory entry (latest) - store encrypted memory
+        const memoryEntry = await tx.memoryEntry.create({
+          data: {
+            memory: encryptedMemory,
+            spaceId: projectId,
+            orgId: space.orgId,
+            userId: ownerId, // Store ownerId for decryption reference
+            version,
+            isLatest: true,
+            parentMemoryId,
+            rootMemoryId,
+            memoryRelations: memoryRelations as any,
+            memoryEmbeddingNew: embeddingStr,
+            memoryEmbeddingNewModel: embeddingModelName(),
+            // note: embedding (vector) is inserted via raw query below
+            metadata: {
+              title: this.extractTitleFromMemory(memory), // Use plaintext for title extraction
+              createdAt: new Date().toISOString(),
+              type: 'user_memory',
+              source: 'chat',
+              updateFrom: primaryParent?.id ?? null,
+            },
+          },
+        });
+
+        // Create a dedicated document for this memory and attach it to the current space
+        const memoryTitle = this.extractTitleFromMemory(memory);
+        const memoryDocument = await tx.document.create({
+          data: {
+            orgId: space.orgId,
+            userId: 'system',
+            title: memoryTitle,
+            type: 'text',
+            status: 'active',
+            metadata: { source: 'chat', synthetic: true },
+          },
+        });
+
+        // Link the document to this space so it appears under the correct project
+        await tx.documentsToSpaces.create({
+          data: {
+            documentId: memoryDocument.id,
+            spaceId: projectId,
+          },
+        });
+
+        // Link the new memory to the created document so it appears in the graph UI
+        await tx.memoryDocumentSource.create({
+          data: {
+            memoryEntryId: memoryEntry.id,
+            documentId: memoryDocument.id,
+            relevanceScore: 100,
+            metadata: { linkedBy: 'chat.service.addMemory' },
+          },
+        });
+
+        // Update column with the vector
+        await tx.$executeRaw`
+          UPDATE "memory_entries"
+          SET "embedding" = ${embeddingStr}::vector
+          WHERE "id" = ${memoryEntry.id}
+        `;
+
+        return { memoryEntry };
+      });
+
+      logger.info({
+        msg: primaryParent ? 'Memory created (update)' : 'Memory created',
+        projectId,
+        memoryId: result.memoryEntry.id,
+        parentMemoryId: primaryParent?.id,
+      });
+      return {
+        success: true,
+        memory: {
+          id: result.memoryEntry.id,
+          status: primaryParent ? 'created:update' : 'created',
+        },
+      };
+    } catch (error) {
+      logger.error({ msg: 'Error adding memory', projectId, error });
+      return {
+        success: false,
+        memory: {
+          id: '',
+          status: 'error',
+        },
+      };
+    }
+  }
+
+  // Fetch specific memory by ID
+  async fetchMemory(memoryId: string, projectId: string): Promise<any> {
+    try {
+      logger.info({
+        msg: 'Fetching memory',
+        projectId,
+        memoryId,
+      });
+      const memory = await prisma.memoryEntry.findFirst({
+        where: {
+          id: memoryId,
+          spaceId: projectId,
+          isLatest: true,
+          isForgotten: false,
+        },
+        include: {
+          space: {
+            select: { ownerId: true },
+          },
+          documentSources: {
+            include: {
+              document: {
+                select: {
+                  id: true,
+                  title: true,
+                  url: true,
+                  type: true,
+                },
+              },
+            },
+          },
+        },
+      });
+
+      if (!memory) {
+        logger.warn({ msg: 'Memory not found', projectId, memoryId });
+        throw new Error('Memory not found');
+      }
+
+      // Get ownerId for decryption
+      const ownerId = memory.userId || memory.space?.ownerId || 'unknown';
+      const decryptedContent = decrypt(memory.memory, ownerId);
+
+      logger.debug({
+        msg: 'Fetched memory with document sources',
+        projectId,
+        memoryId,
+        documentSources: memory.documentSources?.length ?? 0,
+      });
+      return {
+        success: true,
+        memory: {
+          id: memory.id,
+          content: decryptedContent,
+          metadata: memory.metadata,
+          createdAt: memory.createdAt,
+          documentSources: memory.documentSources.map((source) => ({
+            documentId: source.documentId,
+            relevanceScore: source.relevanceScore,
+            document: source.document,
+          })),
+        },
+      };
+    } catch (error) {
+      logger.error({ msg: 'Error fetching memory', projectId, memoryId, error });
+      return {
+        success: false,
+        error: 'Memory not found or access denied',
+      };
+    }
+  }
+
+  // Calculate cosine similarity between two vectors
+  private calculateCosineSimilarity(vecA: number[], vecB: number[]): number {
+    if (vecA.length !== vecB.length) {
+      return 0;
+    }
+
+    let dotProduct = 0;
+    let normA = 0;
+    let normB = 0;
+
+    for (let i = 0; i < vecA.length; i++) {
+      dotProduct += (vecA[i] ?? 0) * (vecB[i] ?? 0);
+      normA += (vecA[i] || 0) * (vecA[i] || 0);
+      normB += (vecB[i] ?? 0) * (vecB[i] ?? 0);
+    }
+
+    if (normA === 0 || normB === 0) {
+      return 0;
+    }
+
+    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+  }
+
+  // Helper to extract title from memory content
+  private extractTitleFromMemory(memory: string): string {
+    // Simple title extraction - first sentence or first 50 chars
+    const sentences = memory.split(/[.!?]/);
+    const firstSentence = sentences[0]?.trim();
+
+    if (firstSentence && firstSentence.length > 10) {
+      return firstSentence.length > 80 ? firstSentence.slice(0, 77) + '...' : firstSentence;
+    }
+
+    // Fallback: first 50 characters
+    return memory.length > 50 ? memory.slice(0, 47) + '...' : memory;
+  }
+}
