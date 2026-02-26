@@ -134,7 +134,7 @@ export const getEmails = async (args: any, userId: any) => {
 };
 
 
-export const getEmailDetails = async (args:any, userId:any) => {
+export const getEmailDetails = async (args: any, userId: any) => {
   try {
     const messageId = args.messageId;
     if (!messageId) return { error: "Message ID is required." };
@@ -160,8 +160,8 @@ export const getEmailDetails = async (args:any, userId:any) => {
     });
 
     const payload = response.data.payload;
-    if(!payload)throw new Error("payload not defined email.agent")
-    const headers = payload.headers;
+    if (!payload) throw new Error("payload not defined email.agent")
+    const headers = payload.headers || [];
 
     // --- 3. Helper to Decode Body ---
     // Recursively finds the text/html or text/plain part and decodes it.
@@ -208,16 +208,16 @@ export const getEmailDetails = async (args:any, userId:any) => {
       data: {
         id: response.data.id,
         threadId: response.data.threadId,
-        subject: headers.find(h => h.name === 'Subject')?.value || '(No Subject)',
-        from: headers.find(h => h.name === 'From')?.value || 'Unknown',
-        to: headers.find(h => h.name === 'To')?.value || 'Unknown',
-        date: headers.find(h => h.name === 'Date')?.value || '',
+        subject: headers?.find(h => h.name === 'Subject')?.value || '(No Subject)',
+        from: headers?.find(h => h.name === 'From')?.value || 'Unknown',
+        to: headers?.find(h => h.name === 'To')?.value || 'Unknown',
+        date: headers?.find(h => h.name === 'Date')?.value || '',
         snippet: response.data.snippet,
         body: emailBody // The full decoded HTML or Text content
       }
     };
 
-  } catch (error:any) {
+  } catch (error: any) {
     console.error('Error fetching email details:', error.message);
 
     if (error.response?.data?.error === 'invalid_grant') {
@@ -232,12 +232,32 @@ export const getEmailDetails = async (args:any, userId:any) => {
 };
 
 
-export const sendEmail = async (args:any, userId:any) => {
+const fetchImageAsBase64 = async (url: string) => {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Failed to fetch image: ${response.statusText}`);
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    const contentType = response.headers.get('content-type') || 'image/png';
+    return {
+      content: buffer.toString('base64'),
+      contentType,
+      filename: url.split('/').pop()?.split('?')[0] || 'image.png'
+    };
+  } catch (error) {
+    console.error('Error fetching image:', error);
+    return null;
+  }
+};
+
+export const sendEmail = async (args: any, userId: any) => {
   try {
     // --- 0. Input Defaults & Validation ---
     const to = args.to;
     const subject = args.subject || "(No Subject)";
     const body = args.body || ""; // HTML or Plain text
+    const imageUrls = args.imageUrls || []; // Array of image URLs to attach
+    const attachments = args.attachments || []; // Optional: [{filename, content, contentType}]
 
     if (!to) {
       return { error: "Recipient email ('to') is required." };
@@ -254,33 +274,54 @@ export const sendEmail = async (args:any, userId:any) => {
     oauth2Client.setCredentials({ refresh_token: user.refreshToken });
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
-    // --- 2. Construct the Raw Email (MIME) ---
-    // The Gmail API requires a base64url encoded string containing 
-    // the full RFC 2822 message (headers + body).
+    // --- 2. Process Image URLs ---
+    const processedAttachments = [...attachments];
+    for (const url of imageUrls) {
+      const imgData = await fetchImageAsBase64(url);
+      if (imgData) {
+        processedAttachments.push(imgData);
+      }
+    }
 
+    // --- 3. Construct the Raw Email (MIME) ---
+    const boundary = "boundary_" + Date.now().toString(16);
     const utf8Subject = `=?utf-8?B?${Buffer.from(subject).toString('base64')}?=`;
 
-    const messageParts = [
-      `To: ${to}`,
-      `Subject: ${utf8Subject}`,
-      `Content-Type: text/html; charset=utf-8`,
-      `MIME-Version: 1.0`,
-      ``, // Empty line separates headers from body
-      body
-    ];
+    let message = "";
+    message += `To: ${to}\r\n`;
+    message += `Subject: ${utf8Subject}\r\n`;
+    message += `MIME-Version: 1.0\r\n`;
 
-    const message = messageParts.join('\n');
+    if (processedAttachments.length > 0) {
+      message += `Content-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n`;
 
-    // Encode the string to Base64URL (safe for URLs)
-    // Standard base64 has '+' and '/', which break API calls. 
-    // We replace '+' with '-' and '/' with '_'.
+      // HTML Body Part
+      message += `--${boundary}\r\n`;
+      message += `Content-Type: text/html; charset=utf-8\r\n\r\n`;
+      message += `${body}\r\n\r\n`;
+
+      // Attachment Parts
+      for (const attachment of processedAttachments) {
+        message += `--${boundary}\r\n`;
+        message += `Content-Type: ${attachment.contentType}; name="${attachment.filename}"\r\n`;
+        message += `Content-Transfer-Encoding: base64\r\n`;
+        message += `Content-Disposition: attachment; filename="${attachment.filename}"\r\n\r\n`;
+        message += `${attachment.content}\r\n\r\n`;
+      }
+      message += `--${boundary}--`;
+    } else {
+      message += `Content-Type: text/html; charset=utf-8\r\n\r\n`;
+      message += body;
+    }
+
+    // Encode the string to Base64URL
     const encodedMessage = Buffer.from(message)
       .toString('base64')
       .replace(/\+/g, '-')
       .replace(/\//g, '_')
       .replace(/=+$/, '');
 
-    // --- 3. Send the Email ---
+    // --- 4. Send the Email ---
     const response = await gmail.users.messages.send({
       userId: 'me',
       requestBody: {
@@ -288,14 +329,14 @@ export const sendEmail = async (args:any, userId:any) => {
       },
     });
 
-    // --- 4. Return Success ---
+    // --- 5. Return Success ---
     return {
       status: "success",
       data: {
         id: response.data.id,
         threadId: response.data.threadId,
         labelIds: response.data.labelIds,
-        message: "Email sent successfully."
+        message: "Email sent successfully." + (processedAttachments.length > 0 ? ` with ${processedAttachments.length} attachment(s).` : "")
       }
     };
 

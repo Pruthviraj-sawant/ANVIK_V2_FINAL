@@ -275,11 +275,17 @@ export async function chatRequest(req: Request, res: Response) {
 
       send_email: tool({
         name: 'send_email',
-        description: 'Send a new email to a recipient.',
+        description: 'Send a new email to a recipient. You can include images by providing their URLs or base64 data.',
         inputSchema: z.object({
           to: z.string().email().describe("Recipient's email address."),
           subject: z.string().describe('Email subject line.'),
           body: z.string().describe('Content of the email (HTML or Text).'),
+          imageUrls: z.array(z.string().url()).optional().describe('List of image URLs to attach.'),
+          attachments: z.array(z.object({
+            filename: z.string(),
+            content: z.string().describe('Base64 encoded content.'),
+            contentType: z.string().describe('e.g., image/png')
+          })).optional().describe('Direct file attachments.')
         }),
         execute: async (args) => {
           return await sendEmail(args, userId);
@@ -668,11 +674,17 @@ export async function chatRequestWithID(req: Request, res: Response) {
 
       send_email: tool({
         name: 'send_email',
-        description: 'Send a new email to a recipient.',
+        description: 'Send a new email to a recipient. You can include images by providing their URLs or base64 data.',
         inputSchema: z.object({
           to: z.string().email().describe("Recipient's email address."),
           subject: z.string().describe('Email subject line.'),
           body: z.string().describe('Content of the email (HTML or Text).'),
+          imageUrls: z.array(z.string().url()).optional().describe('List of image URLs to attach.'),
+          attachments: z.array(z.object({
+            filename: z.string(),
+            content: z.string().describe('Base64 encoded content.'),
+            contentType: z.string().describe('e.g., image/png')
+          })).optional().describe('Direct file attachments.')
         }),
         execute: async (args) => {
           return await sendEmail(args, userId);
