@@ -31,3 +31,6 @@ export { ListCalendarTasksCard, SetCalendarTaskCard } from './task-tool-card';
 
 // Memory tool cards
 export { SearchMemoriesCard, AddMemoryCard, FetchMemoryCard } from './memory-tool-card';
+
+// Image tool cards
+export { ImageGenerationCard } from './image-generation-card';

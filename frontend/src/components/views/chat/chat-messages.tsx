@@ -33,6 +33,7 @@ import {
   SearchMemoriesCard,
   AddMemoryCard,
   FetchMemoryCard,
+  ImageGenerationCard,
   ToolCallGroup,
   MultiStepProgress,
   invocationStateToToolState,
@@ -224,6 +225,16 @@ function ToolInvocationRenderer({
     case 'list_calendar_tasks':
       return <ListCalendarTasksCard key={key} state={state} output={invocation.result as any} />;
 
+    case 'generate_image':
+      return (
+        <ImageGenerationCard
+          key={key}
+          state={state}
+          input={invocation.args as any}
+          output={invocation.result as any}
+        />
+      );
+
     default:
       // For unknown tools, show a generic loading/success state
       const displayName = toolName.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
@@ -329,6 +340,9 @@ function ToolPartRenderer({
     case 'tool-list_calendar_tasks':
     case 'tool-listCalendarTasks':
       return <ListCalendarTasksCard key={key} state={state} output={part.output} />;
+
+    case 'tool-generate_image':
+      return <ImageGenerationCard key={key} state={state} input={part.input} output={part.output} />;
 
     default:
       // For unknown tools, show a generic loading/success state

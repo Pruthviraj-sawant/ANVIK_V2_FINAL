@@ -285,6 +285,72 @@ export async function chatRequest(req: Request, res: Response) {
           return await sendEmail(args, userId);
         },
       }),
+
+      generate_image: tool({
+        name: 'generate_image',     //its limit is :0 cause we have to pay money if we didnt want to pay money then use DALL-E,,dall e is free for 15 images per month
+        description: 'Generate an image based on a text prompt using Gemini 2.0 Flash.',
+        inputSchema: z.object({
+          prompt: z.string().describe('The description of the image to generate.'),
+          aspectRatio: z.enum(['1:1', '4:3', '3:4', '16:9', '9:16']).optional().default('1:1'),
+        }),
+        execute: async ({ prompt, aspectRatio }) => {
+          console.log(`[Image Generation] Prompt: ${prompt}, Aspect Ratio: ${aspectRatio}`);
+          try {
+            const apiKey = process.env.GEMINI_API_KEY;
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent?key=${apiKey}`;
+
+            const response = await fetch(url, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                contents: [{
+                  parts: [{ text: `Generate an image: ${prompt}` }]
+                }],
+                generationConfig: {
+                  responseModalities: ['TEXT', 'IMAGE'],
+                },
+              }),
+            });
+
+            if (!response.ok) {
+              const errorData = await response.json();
+              throw new Error(errorData.error?.message || `API Error: ${response.status}`);
+            }
+
+            const data = await response.json();
+            const candidates = data.candidates;
+            if (!candidates || candidates.length === 0) {
+              throw new Error('No candidates returned from the model.');
+            }
+
+            const parts = candidates[0].content?.parts;
+            if (!parts) {
+              throw new Error('No parts in the response.');
+            }
+
+            const imagePart = parts.find((p: any) => p.inlineData?.mimeType?.startsWith('image/'));
+
+            if (!imagePart || !imagePart.inlineData) {
+              const textPart = parts.find((p: any) => p.text);
+              throw new Error(`No image generated. Model said: "${textPart?.text?.substring(0, 150) || 'nothing'}"`);
+            }
+
+            return {
+              success: true,
+              imageUrl: `data:${imagePart.inlineData.mimeType};base64,${imagePart.inlineData.data}`,
+              prompt,
+            };
+          } catch (error) {
+            console.error('Image generation failed:', error);
+            return {
+              success: false,
+              error: error instanceof Error ? error.message : 'Unknown error',
+            };
+          }
+        },
+      }),
     };
 
     const systemPrompt = `You are a helpful AI assistant with access to the user's personal memories and their Google Workspace (Calendar, Tasks, Gmail).
@@ -678,6 +744,72 @@ export async function chatRequestWithID(req: Request, res: Response) {
           return await sendEmail(args, userId);
         },
       }),
+
+      generate_image: tool({
+        name: 'generate_image',
+        description: 'Generate an image based on a text prompt using Gemini 2.0 Flash.',
+        inputSchema: z.object({
+          prompt: z.string().describe('The description of the image to generate.'),
+          aspectRatio: z.enum(['1:1', '4:3', '3:4', '16:9', '9:16']).optional().default('1:1'),
+        }),
+        execute: async ({ prompt, aspectRatio }) => {
+          console.log(`[Image Generation] Prompt: ${prompt}, Aspect Ratio: ${aspectRatio}`);
+          try {
+            const apiKey = process.env.GEMINI_API_KEY;
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent?key=${apiKey}`;
+
+            const response = await fetch(url, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                contents: [{
+                  parts: [{ text: `Generate an image: ${prompt}` }]
+                }],
+                generationConfig: {
+                  responseModalities: ['TEXT', 'IMAGE'],
+                },
+              }),
+            });
+
+            if (!response.ok) {
+              const errorData = await response.json();
+              throw new Error(errorData.error?.message || `API Error: ${response.status}`);
+            }
+
+            const data = await response.json();
+            const candidates = data.candidates;
+            if (!candidates || candidates.length === 0) {
+              throw new Error('No candidates returned from the model.');
+            }
+
+            const parts = candidates[0].content?.parts;
+            if (!parts) {
+              throw new Error('No parts in the response.');
+            }
+
+            const imagePart = parts.find((p: any) => p.inlineData?.mimeType?.startsWith('image/'));
+
+            if (!imagePart || !imagePart.inlineData) {
+              const textPart = parts.find((p: any) => p.text);
+              throw new Error(`No image generated. Model said: "${textPart?.text?.substring(0, 150) || 'nothing'}"`);
+            }
+
+            return {
+              success: true,
+              imageUrl: `data:${imagePart.inlineData.mimeType};base64,${imagePart.inlineData.data}`,
+              prompt,
+            };
+          } catch (error) {
+            console.error('Image generation failed:', error);
+            return {
+              success: false,
+              error: error instanceof Error ? error.message : 'Unknown error',
+            };
+          }
+        },
+      }),
     };
 
     const convertToModel = await convertToModelMessages(messages);
@@ -694,6 +826,7 @@ After using ANY tool, you MUST write a natural language response that synthesize
 1. Questions about PEOPLE, PREFERENCES, PERSONAL INFO → use search_memories
 2. Questions about actual EMAIL messages → use get_emails  
 3. Questions about CALENDAR → use get_calendar_events
+4. Request to CREATE or GENERATE IMAGES → use generate_image
 
 **RESPONSE SYNTHESIS (MOST IMPORTANT):**
 
