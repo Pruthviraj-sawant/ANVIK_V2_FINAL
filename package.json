@@ -12,10 +12,11 @@
   "devDependencies": {
     "@commitlint/cli": "^19.5.0",
     "@commitlint/config-conventional": "^19.5.0",
+    "docx": "^9.6.1",
+    "eslint": "^9.38.0",
     "husky": "^9.1.7",
     "lint-staged": "^16.2.4",
-    "prettier": "^3.6.2",
-    "eslint": "^9.38.0"
+    "prettier": "^3.6.2"
   },
   "lint-staged": {
     "backend/**/*.{ts,js}": [
