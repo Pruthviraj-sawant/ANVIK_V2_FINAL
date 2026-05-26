@@ -224,7 +224,7 @@ function ToolInvocationRenderer({
     case 'list_calendar_tasks':
       return <ListCalendarTasksCard key={key} state={state} output={invocation.result as any} />;
 
-    default:
+    default: {
       // For unknown tools, show a generic loading/success state
       const displayName = toolName.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
 
@@ -263,6 +263,7 @@ function ToolInvocationRenderer({
       }
 
       return null;
+    }
   }
 }
 
